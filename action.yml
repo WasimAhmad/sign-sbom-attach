@@ -1,0 +1,91 @@
+name: 'Sign/Verify Image and Attach/Verify SBOM Attestation'
+description: 'Signs Docker image, attaches SBOM attestation, and verifies both signatures'
+inputs:
+  region:
+    description: 'GCP Region for Artifact Registry'
+    required: true
+    type: string
+  registry:
+    description: 'Google Artifact Registry URL'
+    required: true
+    type: string
+  cosign-version:
+    description: 'Cosign version to use (e.g., "v1.5.2")'
+    required: false
+    default: 'v1.5.2'
+    type: string
+  sbom-file:
+    description: 'Path to the file which contains SBOM information'
+    required: true
+    type: string
+secrets:
+  COSIGN_PRIVATE_KEY:
+    required: true
+  COSIGN_PUBLIC_KEY:
+    required: true
+  COSIGN_PASSWORD:
+    required: false
+  gcrCredentials:
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Download SBOM artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: sbom-artifact
+        path: .
+
+    - name: Download Image Name Artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: image-name
+        path: .
+        
+    - name: Read Image Name
+      id: read-imagename
+      run: |
+        echo "::set-output name=imagename::$(cat image_name.txt)"
+      shell: bash
+
+    - name: Install Cosign
+      run: |
+        echo "::group::Installation Logs"
+        COSIGN_VERSION="${{ inputs.cosign-version }}"
+        wget https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64 -O cosign
+        chmod +x cosign
+        sudo mv cosign /usr/local/bin/
+        echo "::endgroup::"
+        cosign version
+        
+    - name: Set up Google Cloud CLI
+      uses: google-github-actions/setup-gcloud@v0.2.0
+      with:
+        service_account_key: ${{ secrets.gcrCredentials }}
+        export_default_credentials: true
+
+    - name: Configure Docker for Google Artifact Registry
+      run: gcloud auth configure-docker ${{ inputs.region }}-docker.pkg.dev
+
+    - name: Sign Image and Attach SBOM Attestation
+      env:
+        COSIGN_EXPERIMENTAL: '0'
+        COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+      run: |
+        echo -n "${{ secrets.COSIGN_PRIVATE_KEY }}" | base64 -d > cosign.key
+        echo "::group::Attaching Attestation and Signature"
+        cosign sign --key cosign.key --force ${{ inputs.registry }}/${{ steps.read-imagename.outputs.imagename }}
+        cosign attest --key cosign.key --type spdx --predicate ${{ inputs.sbom-file }} --force ${{ inputs.registry }}/${{ steps.read-imagename.outputs.imagename }}
+        echo "::endgroup::"
+        rm cosign.key
+      
+    - name: Verify Image and SBOM Attestation Signatures
+      env:
+        COSIGN_EXPERIMENTAL: '0'
+      run: |
+        echo -n "${{ secrets.COSIGN_PUBLIC_KEY }}" | base64 -d > cosign.pub
+        echo "::group::Verifying Attestation and Signature"
+        cosign verify --key cosign.pub ${{ inputs.registry }}/${{ steps.read-imagename.outputs.imagename }}
+        cosign verify-attestation --key cosign.pub ${{ inputs.registry }}/${{ steps.read-imagename.outputs.imagename }}
+        echo "::endgroup::"
+        rm cosign.pub
